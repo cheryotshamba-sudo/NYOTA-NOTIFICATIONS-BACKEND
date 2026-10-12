@@ -84,9 +84,7 @@ function verifyPaylorSignature(req) {
     return false;
   }
 
-  const signature =
-    req.get("x-webhook-signature") ||
-    req.get("x-paylor-signature");
+  const signature = req.get("x-payment-signature");
 
   if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) {
     return false;
