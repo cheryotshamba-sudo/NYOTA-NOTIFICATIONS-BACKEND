@@ -11,10 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-/*
- * Preserve the original request bytes.
- * Paylor's signature must be checked against these exact bytes.
- */
+// Preserve the original request body for Paylor signature verification.
 app.use(
   express.json({
     limit: "100kb",
@@ -24,7 +21,7 @@ app.use(
   })
 );
 
-// Database connection
+// PostgreSQL connection
 const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -34,7 +31,7 @@ const pool = process.env.DATABASE_URL
     })
   : null;
 
-// Health check
+// Main health check
 app.get("/", (req, res) => {
   res.json({
     app: "NYOTA Payment Notifications",
@@ -42,6 +39,7 @@ app.get("/", (req, res) => {
     paymentVerification: process.env.PAYLOR_WEBHOOK_SECRET
       ? "configured"
       : "missing secret",
+    database: pool ? "configured" : "not configured",
     smsNotifications: "not configured"
   });
 });
@@ -72,11 +70,7 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-/*
- * Verify Paylor's HMAC-SHA256 signature.
- * Supports both local payment callbacks and
- * Global payment webhooks.
- */
+// Verify the Paylor webhook signature using the original request bytes.
 function verifyPaylorSignature(req) {
   const secret = process.env.PAYLOR_WEBHOOK_SECRET;
 
@@ -84,9 +78,21 @@ function verifyPaylorSignature(req) {
     return false;
   }
 
-  const signature = req.get("x-payment-signature");
+  // Paylor documentation lists different headers for local and Global
+  // webhooks. Also accept the header shown in your dashboard.
+  const signature =
+    req.get("x-webhook-signature") ||
+    req.get("x-paylor-signature") ||
+    req.get("x-payment-signature");
 
-  if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) {
+  if (!signature) {
+    return false;
+  }
+
+  const normalizedSignature = signature.trim();
+
+  // Paylor documentation specifies a hexadecimal SHA-256 HMAC.
+  if (!/^[a-f0-9]{64}$/i.test(normalizedSignature)) {
     return false;
   }
 
@@ -95,7 +101,7 @@ function verifyPaylorSignature(req) {
     .update(req.rawBody)
     .digest();
 
-  const received = Buffer.from(signature, "hex");
+  const received = Buffer.from(normalizedSignature, "hex");
 
   return (
     received.length === expected.length &&
@@ -103,10 +109,7 @@ function verifyPaylorSignature(req) {
   );
 }
 
-/*
- * Paylor callback endpoint.
- * Both paths are available for easier configuration.
- */
+// Receive verified Paylor webhook notifications.
 function handlePaylorWebhook(req, res) {
   if (!process.env.PAYLOR_WEBHOOK_SECRET) {
     console.error("PAYLOR_WEBHOOK_SECRET is missing.");
@@ -117,7 +120,7 @@ function handlePaylorWebhook(req, res) {
   }
 
   if (!verifyPaylorSignature(req)) {
-    console.warn("Rejected webhook: invalid signature.");
+    console.warn("Paylor webhook rejected: invalid signature.");
 
     return res.status(401).json({
       error: "Invalid webhook signature."
@@ -126,60 +129,74 @@ function handlePaylorWebhook(req, res) {
 
   const payload = req.body;
 
-  if (!payload || typeof payload !== "object" ||
-      Array.isArray(payload)) {
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    typeof payload.event !== "string"
+  ) {
     return res.status(400).json({
       error: "Invalid webhook payload."
     });
   }
 
-  const event = payload.event;
-  const transaction = payload.transaction || {};
+  // Paylor sends local events with a transaction object and
+  // Global collection events with fields at the top level.
+  const transaction =
+    payload.transaction &&
+    typeof payload.transaction === "object" &&
+    !Array.isArray(payload.transaction)
+      ? payload.transaction
+      : {};
 
   const reference =
-    transaction.reference || payload.merchantReference ||
-    payload.reference || null;
+    transaction.reference ||
+    payload.merchantReference ||
+    payload.reference ||
+    null;
 
-  /*
-   * Log only essential event details.
-   * Do not treat an event as a database credit or SMS
-   * trigger until reconciliation and idempotency are added.
-   */
-  console.log("Verified Paylor webhook:", {
-    event: typeof event === "string" ? event : "unknown",
+  const status =
+    transaction.status ||
+    payload.status ||
+    null;
+
+  // Log minimal details. Never log secrets or full payment payloads.
+  console.log("Verified Paylor webhook received:", {
+    event: payload.event,
     reference:
       typeof reference === "string" ? reference : null,
+    status: typeof status === "string" ? status : null,
     receivedAt: new Date().toISOString()
   });
 
-  // A verified notification is not, by itself, a completed
-  // application-level reconciliation or customer notification.
+  // A verified notification is not yet a database update,
+  // payment reconciliation, or SMS notification.
   return res.status(200).json({
     received: true,
     verified: true
   });
 }
 
+// Register both callback paths.
 app.post("/api/paylor-callback", handlePaylorWebhook);
 app.post("/paylor-callback", handlePaylorWebhook);
 
-// Existing payment-status route remains informational only.
+// Informational payment-status endpoint.
 app.get("/api/payment-status", (req, res) => {
   res.json({
     status: "not_configured",
-    message:
-      "Customer payment status lookup has not been connected."
+    message: "Payment status lookup has not been connected."
   });
 });
 
-// Not found
+// Handle unknown routes.
 app.use((req, res) => {
   res.status(404).json({
     error: "Endpoint not found."
   });
 });
 
-// Error handler
+// Handle malformed JSON and other errors.
 app.use((err, req, res, next) => {
   if (err.type === "entity.parse.failed") {
     return res.status(400).json({
@@ -195,17 +212,19 @@ app.use((err, req, res, next) => {
 
   console.error("Server error:", err.message);
 
-  res.status(500).json({
+  return res.status(500).json({
     error: "An internal server error occurred."
   });
 });
 
+// Start server.
 const server = app.listen(PORT, () => {
   console.log(
     `NYOTA Payment Notifications listening on port ${PORT}`
   );
 });
 
+// Graceful shutdown.
 async function shutdown() {
   server.close(async () => {
     if (pool) {
